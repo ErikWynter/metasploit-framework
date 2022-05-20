@@ -214,7 +214,7 @@
     end
 
     def enum_domain_controllers(fqdns)
-      if fqdns.empty?
+      if fqdns.nil? || fqdns.empty?
         vprint_error("Cannot enumerate domain controllers because no FQDNs were obtained.")
         return 1
       end
