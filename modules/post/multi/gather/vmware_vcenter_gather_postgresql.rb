@@ -349,7 +349,10 @@ class MetasploitModule < Msf::Post
 
       print_good("Password decrypted! Remote host:#{remote_ip_dns} - Username:#{username} - Password:#{password}")
       # replace the hash with the password and save the new line so we can save a new table later
-      new_cline = cline.gsub(vpxuser_hash_raw, password)
+      # gsub lead to unexpected results, so let's justsplit the line and do it manually
+      cline_split = cline.split('|')
+      cline_split[1] = %( #{password} )
+      new_cline = cline_split.join('|')
       vpxuser_results << new_cline
     end
 
