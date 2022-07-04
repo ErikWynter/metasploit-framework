@@ -404,7 +404,7 @@ class MetasploitModule < Msf::Post
     else
       os_name = cmd_exec('grep -w NAME= /etc/os-release | cut -d "=" -f 2-')
     end
-    unless os_name && os_name.include?('VMware Photon')
+    unless os_name && os_name.downcase.include?('photon')
       fail_with(Failure::NoTarget, "Target is not a VMware vCenter Server.")
     end
 
